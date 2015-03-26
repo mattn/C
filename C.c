@@ -25,21 +25,42 @@
  */
 
 
-#include <ctype.h>
-#include <dirent.h>
-#include <errno.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/param.h>
-#include <sys/signal.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/wait.h>
-#include <time.h>
-
-#include <unistd.h>
+#ifndef _WIN32
+# include <ctype.h>
+# include <dirent.h>
+# include <errno.h>
+# include <stdarg.h>
+# include <stdio.h>
+# include <stdlib.h>
+# include <string.h>
+# include <sys/param.h>
+# include <sys/signal.h>
+# include <sys/stat.h>
+# include <sys/time.h>
+# include <sys/wait.h>
+# include <time.h>
+# include <unistd.h>
+# define A_OUT "a.out"
+# define PATH_SEP "/"
+#else
+# define lstat(p,s) stat(p,s)
+# include <windows.h>
+# include <ctype.h>
+# include <dirent.h>
+# include <errno.h>
+# include <stdarg.h>
+# include <stdio.h>
+# include <stdlib.h>
+# include <string.h>
+# include <signal.h>
+# include <sys/stat.h>
+# include <time.h>
+# undef mkdir
+# define mkdir(p,m) _mkdir(p)
+# define A_OUT "a.exe"
+# define PATH_SEP "\\"
+# define utimes(a,b) _utime(a,b)
+#endif
 
 
 #define VERSION_STR "0.06"
@@ -68,6 +89,46 @@ char** lopts;
 char spec[65536];
 int spec_size; // -1 if not used
 
+#ifdef _WIN32
+static int spawn_w32(char** argv, int* status) {
+  char** args = argv;
+  DWORD ret = -1;
+  char* cmdline = NULL;
+  STARTUPINFO si = { sizeof(STARTUPINFO) };
+  PROCESS_INFORMATION pi;
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_SHOWNORMAL;
+  char path[MAX_PATH];
+  int n = 0;
+
+  if (status) *status = -1;
+  for (args = argv; *args; args++) {
+    int i;
+    int len = strlen(*args);
+    if (n > 0)
+      path[n++] = ' ';
+    path[n++] = '"';
+    for (i = 0; i < len; i++) {
+      if ((*args)[i] == '"') {
+        path[n++] = '\\';
+      }
+      path[n++] = (*args)[i];
+    }
+    path[n++] = '"';
+  }
+  path[n] = 0;
+
+  if (CreateProcess(NULL, (char*) path, NULL, NULL, TRUE,
+      NORMAL_PRIORITY_CLASS, NULL, NULL, &si, &pi)) {
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &ret);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    if (status) *status = 0;
+  }
+  return ret;
+}
+#endif
 
 static void cmd_error(char* fmt, ...);
 
@@ -114,7 +175,7 @@ static void remove_dir(char* path)
   }
   while ((e = readdir(d)) != NULL) {
     if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) {
-      file = str_concat(str_concat(str_dup(path), "/"), e->d_name);
+      file = str_concat(str_concat(str_dup(path), PATH_SEP), e->d_name);
       unlink(file);
       free(file);
     }
@@ -140,7 +201,8 @@ static void show_version(void)
 	"This is free software; see the source for copying conditions.  There is NO\n"
 	"warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n"
 	"\n"
-	"Written by Kazuho Oku (http://labs.cybozu.co.jp/blog/kazuhoatwork/)\n",
+	"Written by Kazuho Oku (http://labs.cybozu.co.jp/blog/kazuhoatwork/)\n"
+	"Win32 Porting by Yasuhiro Matsumoto (http://mattn.kaoriya.net/)\n",
 	stdout);
   exit(0);
 }
@@ -208,8 +270,8 @@ static void make_temp_dir(void)
   srand((int)time(NULL) ^ (int)getpid());
   
   for (rep = 0; rep < MAX_TRIES; rep++) {
-    char randbuf[sizeof("/tmp/01234567")];
-    sprintf(randbuf, "/tmp/%08x", rand());
+    char randbuf[sizeof(PATH_SEP "tmp" PATH_SEP "01234567")];
+    sprintf(randbuf, PATH_SEP "tmp" PATH_SEP "%08x", rand());
     temp_dir = str_concat(str_dup(root_dir), randbuf);
     if (mkdir(temp_dir, 0777) == 0) {
       return;
@@ -225,7 +287,7 @@ static void build_store_dir(void)
 {
 #define BASE 65521
   
-  char buf[sizeof("/cache/01234567")];
+  char buf[sizeof(PATH_SEP "cache" PATH_SEP "01234567")];
   unsigned long s1 = 1;
   unsigned long s2 = 0;
   int n;
@@ -235,7 +297,7 @@ static void build_store_dir(void)
     s2 = (s2 + s1) % BASE;
   }
   
-  sprintf(buf, "/cache/%08lx", (s2 << 16) + s1);
+  sprintf(buf, PATH_SEP "cache" PATH_SEP "%08lx", (s2 << 16) + s1);
   store_dir = str_concat(str_dup(root_dir), buf);
   
 #undef BASE
@@ -251,14 +313,14 @@ static void update_cache(void)
   
   num_files = 0;
   
-  cache_root = str_concat(str_dup(root_dir), "/cache");
+  cache_root = str_concat(str_dup(root_dir), PATH_SEP "cache");
   if ((d = opendir(cache_root)) != NULL) {
     while ((e = readdir(d)) != NULL) {
       struct stat st;
       if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
 	continue;
       }
-      filename = str_concat(str_concat(str_dup(cache_root), "/"), e->d_name);
+      filename = str_concat(str_concat(str_dup(cache_root), PATH_SEP), e->d_name);
       if (stat(filename, &st) == 0 && S_ISDIR(st.st_mode)) {
 	if (oldest_dir == NULL || st.st_mtime < oldest_mtime) {
 	  free(oldest_dir);
@@ -294,7 +356,7 @@ static int check_specs(void)
   char comp_spec[sizeof(spec)];
   int equal = 0;
   
-  comp_file = str_concat(str_dup(store_dir), "/SPECS");
+  comp_file = str_concat(str_dup(store_dir), PATH_SEP "SPECS");
   if ((fp = fopen(comp_file, "rb")) != NULL) {
     if (fread(comp_spec, 1, spec_size, fp) == spec_size &&
 	fgetc(fp) == EOF &&
@@ -313,7 +375,7 @@ static void save_specs(void)
   char* filename;
   FILE* fp;
   
-  filename = str_concat(str_dup(temp_dir), "/SPECS");
+  filename = str_concat(str_dup(temp_dir), PATH_SEP "SPECS");
   if ((fp = fopen(filename, "wb")) == NULL) {
     cmd_error("failed to write file: %s : %s\n", filename, strerror(errno));
   }
@@ -324,6 +386,25 @@ static void save_specs(void)
 
 static int call_proc(char** argv, char* errmsg)
 {
+#ifdef _WIN32
+  int status, ret;
+  ret = spawn_w32(argv, &status);
+  if (status) {
+    LPVOID buf = "";
+    FormatMessage(
+      FORMAT_MESSAGE_ALLOCATE_BUFFER |
+      FORMAT_MESSAGE_FROM_SYSTEM,
+      NULL,
+      GetLastError(),
+      MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+      (LPTSTR) &buf,
+      0,
+      NULL);
+    cmd_error("%s: %s : %s\n", errmsg, argv[0], buf);
+    LocalFree(buf);
+  }
+  return status;
+#else
   pid_t pid;
   int status;
 
@@ -349,6 +430,7 @@ static int call_proc(char** argv, char* errmsg)
     cmd_error(NULL); /* silently exit(255) */
   }
   return WEXITSTATUS(status);
+#endif
 }
 
 
@@ -500,7 +582,17 @@ static char** parse_args(char** argv, char* file, int line)
 
 void setup_dir(void)
 {
-  char* dirname, buf[sizeof("/LARGE_C-01234567")];
+#ifdef _WIN32
+  char* dirname;
+  int old_umask = -1;
+  char tmppath[MAX_PATH];
+  if (GetTempPath(sizeof(tmppath), tmppath) == 0) {
+    cmd_error("failed to stat tmpdir\n");
+  }
+  tmppath[strlen(tmppath)-1] = 0;
+  root_dir = str_dup(tmppath);
+#else
+  char* dirname, buf[sizeof(PATH_SEP "LARGE_C-01234567")];
   uid_t euid = geteuid();
   int old_umask = -1;
   
@@ -509,7 +601,7 @@ void setup_dir(void)
     root_dir = str_dup(root_dir);
   } else {
     old_umask = umask(077);
-    sprintf(buf, "/LARGE_C-%u", (unsigned)euid);
+    sprintf(buf, PATH_SEP "LARGE_C-%u", (unsigned)euid);
     root_dir = str_concat(str_dup(P_tmpdir), buf);
     if (mkdir(root_dir, 0700) != 0) {
       struct stat st;
@@ -521,11 +613,13 @@ void setup_dir(void)
       }
     }
   }
+#endif
+
   /* make subdirs */
-  dirname = str_concat(str_dup(root_dir), "/cache");
+  dirname = str_concat(str_dup(root_dir), PATH_SEP "cache");
   mkdir(dirname, 0777);
   free(dirname);
-  dirname = str_concat(str_dup(root_dir), "/tmp");
+  dirname = str_concat(str_dup(root_dir), PATH_SEP "tmp");
   mkdir(dirname, 0777);
   free(dirname);
   
@@ -584,10 +678,18 @@ int main(int argc, char** argv)
   if (store_dir != NULL && check_specs()) {
     char** child_argv = NULL;
     utimes(store_dir, NULL); /* update mtime of the directory */
-    exec_file = str_concat(str_dup(store_dir), "/a.out");
+    exec_file = str_concat(str_dup(store_dir), PATH_SEP A_OUT);
     child_argv = sa_concat(child_argv, exec_file);
     child_argv = sa_merge(child_argv, argv + 1);
+#ifdef _WIN32
+    {
+      int status;
+      ret = spawn_w32(child_argv, &status);
+      if (status == 0) exit(ret);
+    }
+#else
     execv(exec_file, child_argv);
+#endif
     // if execv failed, we compile
     free(exec_file);
     remove_dir(store_dir);
@@ -595,8 +697,8 @@ int main(int argc, char** argv)
   
   /* prepare files */
   make_temp_dir();
-  exec_file = str_concat(str_dup(temp_dir), "/a.out");
-  c_file = str_concat(str_dup(temp_dir), "/source.c");
+  exec_file = str_concat(str_dup(temp_dir), PATH_SEP A_OUT);
+  c_file = str_concat(str_dup(temp_dir), PATH_SEP "source.c");
   if ((src_fp = fopen(c_file, "wt")) == NULL) {
     cmd_error("failed to create temporary file: %s : %s\n", c_file,
 	      strerror(errno));
@@ -623,6 +725,15 @@ int main(int argc, char** argv)
       if ((fp = fopen(file, "rt")) == NULL) {
 	cmd_error("cannot open file: %s : %s\n", file, strerror(errno));
       }
+#ifdef _WIN32
+      {
+        char* p = file;
+        while (*p) {
+          if (*p == '\\') *p = '/';
+          p += isleadbyte(*p) ? 2 : 1;
+        }
+      }
+#endif
       fprintf(src_fp, "# 1 \"%s\" 1\n", file);
     }
     while ((line = get_line(fp)) != NULL) {
